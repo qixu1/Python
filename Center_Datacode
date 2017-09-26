@@ -1,0 +1,399 @@
+# -*- coding: utf-8 -*-
+"""
+TIMEfit main module, see readme.md for details.
+Michael Jay Walsh, Ph.D.
+Center for Integration of Science & Industry, Bentley University
+2014-2015
+"""
+
+import sys
+import getopt
+
+import pandas as pd
+import numpy as np
+import os
+from datetime import datetime
+import re
+
+import TIMEfitEngine
+#import TIMEgraph
+import TIMEget
+#import TIMExl
+import TIMEfunc
+
+import psycopg2
+from sqlalchemy import create_engine
+
+from scipy.stats import pearsonr#, shapiro
+
+#params = {
+#  'dbname': 'cisidb',
+#  'user': 'cisi',
+#  'password': 'rFlkqb9u',
+#  'host': 'blade-209.bentley.edu',
+#  'port': 45432
+#}
+
+#conn = psycopg2.connect(**params)
+#cur = conn.cursor()
+#conn.autocommit = True
+
+#engine = create_engine(r'postgresql://cisi:rFlkqb9u@blade-206.bentley.edu:45432/cisidb')
+
+
+#FITTYPES = ['exponentialdNdt','logisticdNdt','powerlogdNdt','gompertzdNdt'] + ['exponential','logistic','powerlog','gompertz'] 
+#FITTYPES = ['exponentialdNdt','logisticdNdt','powerlogdNdt','gompertzdNdt','richardsdNdt'] + ['exponential','logistic','powerlog','gompertz','richards'] 
+FITTYPES =  ['gompertzdNdt','powerlogdNdt'] 
+#+ ['powerlog'] + ['gompertz']
+
+#FITTYPES = ['powerlog','powerlogdNdt'] 
+### Select Output Results
+PARAMETERS = ['fittyp','L','L_err','logL','r','r_err','t0','t0_err','T_I','T_I_err','T_G','T_E','T_E_err','T_span','ti_n1','ti','ti_p1','tspan','MI','MIabs','Nerr_ModelAvg']
+STATISTICS = ['RMSE_annual','RMSE_cumulative','AICc_annual','AICc_cumulative']
+#STATISTICS = ['RMSE_annual','pearson_annual','AICc_annual','RMSE_cumulative','pearson_cumulative','AICc_cumulative']
+OUTPUT = PARAMETERS + STATISTICS
+
+              
+class QueryFrame:
+    ### Primary instance for a specific query, containing data and several fits
+    def __init__(self,runid,cur,conn):
+#    def __init__(self,query,name='',startyear=1950,endyear=2015):
+        self.__type__ = 'QueryFrame'   
+        self.runid = runid
+        #self.query = query
+        self.fits = {}
+        self.fitDateTime = datetime.now()
+        #self.filename = re.sub(r'\W+', '', query)[0:20]
+        #self.name = name
+        #self.startyear = startyear
+        #self.endyear = endyear
+#        self.Operator = os.getlogin()
+        self.rundate = datetime.now()
+              
+    def __repr__(self):
+        return 'Query Frame for: ' + self.name
+    
+    def __getitem__(self,fittyp):
+        return self.fits[fittyp]
+        
+    def __iter__(self):
+            return iter(list(self.fits.items()))
+        
+    def getdata(self,source='PubMed'):        
+        getfunc = eval('TIMEget.'+source)
+        self.data, self.queryinfo = getfunc(self.query,int(self.startyear),int(self.endyear))
+        ### ADD PUBMED ###
+
+    def loadDataSQL(self,conn):
+        """Load from SQL Data"""   
+        self.data = pd.read_sql('SELECT year,count FROM time.counts WHERE RUNID  = '+str(self.runid),conn,index_col='year')
+        self.data.columns=['N'] # RENAME COUNTS COLUMN AS 'N' 
+        self.data['year']=self.data.index
+        self.data['Ntot']=self.data.N.cumsum()
+        self.data['logNtot']=np.log10(self.data.Ntot)
+    
+    def loadDataCSV(self,filename):
+        """Load single CSV"""        
+        self.data = pd.read_csv(filename,index_col='year')
+        self.data.columns=['N']
+        self.data['year']=self.data.index
+        self.data['Ntot']=self.data.N.cumsum()
+        self.data['logNtot']=np.log10(self.data.Ntot)
+    
+    def fitCurve(self, fittyp, runBoot=True,runHindBoot=True):
+        #works for generating dict only: self.fits[fittype] = Fit(self.data)
+        print(('Fitting ' + fittyp + ' Model'))
+        print('---------------------------------')
+        self.fits[fittyp] = Fit(self.data,fittyp,runBoot=runBoot,runHindBoot=runHindBoot)               
+        setattr(self,fittyp,self.fits[fittyp])
+        print('---------------------------------')
+    
+    def fitCurves(self, runBoot = True,runHindBoot=True):
+        print('*************************************')       
+        print(('Fitting '))# + self.query))         
+        print('*************************************')  
+        self.fitDateTime = datetime.now()
+        for f in FITTYPES:
+            self.fitCurve(fittyp=f, runBoot=runBoot, runHindBoot=runHindBoot)
+                        
+    def generateStatTable(self,level='annual'):
+        statlist = []         
+        for fty, fit in list(self.fits.items()):
+            statlist.append(pd.DataFrame(fit.stats,index=[fty]))
+        self.stattable = pd.concat(statlist)
+        
+        self.beststat = {}
+        for stat,value in list(self.stattable.items()):
+            if 'pearson' in stat:
+                self.beststat[stat] = value.idxmax()
+            else:
+                self.beststat[stat] = value.idxmin() 
+#    
+#    def XLout(self):
+#        TIMExl.xlQuery(self, OUTPUT, FITTYPES)     
+#    
+    def FitBests(self):
+        fbdict = {}
+        print('Performing Best Year Fits')
+        print('************************')
+        for fty in FITTYPES:
+            if ('powerlog' in fty) or ('expon' in fty) or ('gomp' in fty):            
+                try:
+                   self.fits[fty + 'BestYear'] = Fit(self.data.loc[min(self.data.index):self.fits[fty].BestYear],fittyp=fty,runHind=True,runBoot=True,runHindBoot=False)
+                   setattr(self,fty+'BestYear',self.fits[fty + 'BestYear'])
+                   fbdict[fty] = self.fits[fty].BestYear
+                   self.MISCSeries = pd.Series(fbdict,index=list(fbdict.keys()))  
+                except: pass
+    
+    def writeTOdb(self,cur,conn):
+        
+        #Generate generic insert statement for all parameters
+    #    insert_stmt = "INSERT INTO fitdata (RUNID,startyear,endyear,hindcast"
+        insert_stmt = "INSERT INTO time.fitdata (runid,hindcast"    
+        insert_stmt = insert_stmt.replace('(,','(')
+        for i in PARAMETERS:
+            insert_stmt += ',' + i
+    #        for i in STATISTICS:
+    #            insert_stmt += ',' + i
+    #    insert_stmt += ') VALUES (' + ('%s,' * (len(PARAMETERS)+4))[:-1] + ');'
+        insert_stmt += ') VALUES (' + ('%s,' * (len(PARAMETERS)+2))[:-1] + ');'
+        #insert_stmt += ') VALUES (' + ('%s,' * (len(PARAMETERS)+len(STATISTICS)+1))[:-1] + ')'
+    
+        #generate and insert data by fittyp
+        for fty in FITTYPES:
+            #data = (123,q.startyear,q.endyear,'0')
+            data = (self.runid,'0')
+            for p in PARAMETERS:
+                data += (str(self.fits[fty].results.get(p,0)),)            
+                #        for s in STATISTICS:
+                #            try: data += (str(q.fits[fty].results[s]),)            
+                #            except: data += '0' #(str(0),) 
+    
+
+            cur.execute(insert_stmt,data)
+            
+            #insert hindcasted data
+            hc = self.fits[fty].hindcast
+            hc = hc.drop('logL_err',1)
+    
+            hc = hc.drop('Cuml_Proj',1)#        
+            hc = hc.drop('Cuml_ProjNorm',1)
+            #hc = hc.drop('tspan_err',axis=1,errors='ignore')
+            hc['runid']= self.runid
+            hc['hindcast']= '1' 
+            #hc['startyear']= q.startyear
+            hc['endyear']=hc.year
+            hc=hc.drop('year',1)
+            ncs = hc.columns
+            ncs2 = [i.lower() for i in ncs]
+            hc=hc.replace(np.inf,np.nan)
+            hc.columns = ncs2
+ #           print('HI OMG HI\n\n\n')
+#            hc.to_sql('fitdata',engine,schema='time',if_exists='append',index=False)
+    
+###########################
+#### Fitting Functions ####
+###########################
+
+class Fit:
+    def __init__(self,data,fittyp='powerlogdNdt',runHind=True,runBoot=True,runHindBoot=True):
+        pforw = 10
+        pback = 10
+        self.fittyp = fittyp
+        self.data = data
+        self.datapoints = len(data['Ntot'])
+        
+        ### Fit ###        
+        print('Performing preliminary fit')
+        runfunc = eval('TIMEfitEngine.'+fittyp.replace('dNdt','')+'FIT')
+        self.results = runfunc(data,fittyp)
+        
+        ### Model ###
+        print('Generating models')
+        Tmodel = np.linspace(min(data.year) - pback, max(data.year) + pforw,
+                             max(data.year) - min(data.year) + pforw + pback + 1)
+        self.Model = pd.DataFrame({'year':Tmodel},index = Tmodel)
+        self.model(fittyp)      
+
+        paramvals = getParams(self)
+
+        self.stats, self.residuals = multistats(data, paramvals, fittyp)        
+
+        if runHind:
+            print('Running Hindcasts')              
+            self.hindcast = TIMEfitEngine.hindcast(data,fittyp)
+            if 'exponential' in fittyp:
+                self.hindcast['Cuml_ProjNorm'] = self.hindcast.Cuml_Proj/max(data.Ntot)
+            else:
+                self.hindcast['Cuml_ProjNorm'] = self.hindcast.Cuml_Proj/self.results['L']
+
+        #### runBoots ####
+        if runBoot:
+            print('Running Bootstraps:')            
+            trials = 1
+            self.bootmodel = None
+            self.bootres = None
+            self.Nerrors = None
+            while trials <= 10:            
+                try:        
+                    self.bootres, self.bootmodel, self.Nerrors = TIMEfitEngine.bootstrap(self, data)
+                    self.results['Nerr_ModelAvg'] = self.Nerrors['ModelAvg']
+                    print(('    bootstrap sucessful on try ' + str(trials))) 
+                    break
+                except: 
+                    print(('    bootstrap failed on try ' + str(trials))) 
+                    trials += 1
+            if type(self.bootres) != None and 'powerlog' in fittyp: 
+                try: 
+                    self.T_I_err = self.bootres.T_I.std()
+                    self.T_E_err = self.bootres.T_E.std()
+                ### THESE Point to the LCI and LCM of bootstrap
+                    self.results['T_I_err']=self.T_I_err
+                    self.results['T_E_err']=self.T_E_err
+                except: pass
+            
+            if runHindBoot == True:
+                if ('powerlog' in fittyp) or ('expon' in fittyp):
+                    print('Running HindBootstraps')
+                    try:                    
+                        self.Nerrors_hc = TIMEfitEngine.hinderrors(self,data)                   
+                        self.BestYear = self.Nerrors_hc.ModelAvg.idxmin()
+                    except: pass
+                ###Generate Error Map and Grids###
+
+#        self.errormap = TIMEfunc.errormap(self)
+#        self.egrd, self.rgrd, self.t0grd = TIMEfunc.surferror(self)
+        
+    def model(self,fittyp):
+
+        paramvals = getParams(self)
+        
+        if 'dNdt' in fittyp:
+            functype = fittyp[:-4]
+        else:
+            functype = fittyp
+        fitfuncdNdt = eval('TIMEfunc.'+functype+'dNdt')
+        fitfunc = eval('TIMEfunc.'+functype)
+        
+        self.Model['N'] = fitfuncdNdt(self.Model.year, *paramvals)
+        self.Model['Ntot'] = fitfunc(self.Model.year, *paramvals)
+        if 'loglog' in fittyp:
+            self.Model['logNtot'] = fitfunc(self.Model.year, *paramvals)
+            self.Model['Ntot'] = 10**(self.Model.logNtot)
+            self.Model['N'] = self.Model.Ntot.diff(1) 
+        else:
+            self.Model['N'] = fitfuncdNdt(self.Model.year, *paramvals)
+            self.Model['Ntot'] = fitfunc(self.Model.year, *paramvals) 
+
+    def N_Cumulative(self,year):
+        fitfunc = eval('TIMEfunc.'+self.fittyp.replace('dNdt',''))
+        params = (year,)
+        for i in fitTIMEfunc.__code__.co_varnames:
+            if i != 't': 
+                params += self.results[i], 
+        return fitfunc(*params)
+        
+    def N_Annual(self,year):
+        if 'dNdt' not in self.fittyp:           
+            fitfunc = eval('TIMEfunc.'+self.fittyp+'dNdt')
+        else:
+            fitfunc = eval('TIMEfunc.'+self.fittyp)
+        params = (year,)
+        for i in fitTIMEfunc.__code__.co_varnames:
+            if i != 't': 
+                params += self.results[i], 
+        return fitfunc(*params)
+        
+        
+##########################
+#### Helper Functions ####
+##########################
+
+
+def multistats(df,params,fittyp):
+
+    fitmodel = fittyp.replace('dNdt','')
+    annfunc = eval('TIMEfunc.'+fitmodel+'dNdt')  
+    cumulativefunc= eval('TIMEfunc.'+fitmodel)  
+    
+    Mann = annfunc(df.year,*params)
+    Mcuml = cumulativefunc(df.year,*params)
+    Mlogc = np.log10(cumulativefunc(df.year, *params))
+    statsout = {}
+    stats_ann,resids_ann = modelstats(df['N'], Mann, 3)
+    stats_cumul,resids_cumul = modelstats(df['Ntot'], Mcuml, 3)
+    stats_logc,resids_logc = modelstats(df['logNtot'], Mlogc, 3)
+    for k,v in list(stats_ann.items()):
+        statsout[k+'_annual'] = v
+    for k,v in list(stats_cumul.items()):
+        statsout[k+'_cumulative'] = v
+    for k,v in list(stats_logc.items()):
+        statsout[k+'_logcumulative'] = v
+
+    residuals = pd.DataFrame({'annual':resids_ann,'cumulative':resids_cumul, 'logcumul':resids_logc})
+
+    return statsout, residuals
+
+def modelstats(N,M,K,trim='half'):
+    """Runs basic model statistics returning RSS, RSME, AICc, BIC"""
+
+    if trim == 'half':
+        trim = int(len(N)/2)
+    n = len(N[-trim:])    
+    resids = M[-trim:]-N[-trim:]    
+    RSS = sum(resids**2) 
+    RMSE = np.sqrt(RSS/n)    # Unbias? Subtract K from np?
+    pearson = pearsonr(N,M)[0]
+    #AICc and BIC are calculated as in JMP:
+    #http://www.jmp.com/support/help/The_Stepwise_Report.shtml
+    # AICc Also confirmed at http://adorio-research.org/wordpress/?p=1932, bic in this package appears to differ from JMP!
+    AICc = n * (np.log(2*np.pi*RSS/n)+1) + 2 * K + 2 * K * (K+1)/(n-K-1)
+    #BIC = n * (np.log(2*np.pi*RSS/n)+1) + K * np.log(n)
+    ### TESTS ONLY THE LAST 15 RESIDUALS
+    #SWw, SWp = shapiro(resids[-20:])    
+    
+    out = {'RSS':RSS, 'RMSE':RMSE, 'AICc':AICc, 'pearson':pearson}#, 'BIC':BIC, 'SWp':SWp, 'SWw':SWw}
+
+    return out,resids
+
+def getParams(fit):
+    paramvals = ()
+    for i in list(fit.results['params'].params.keys()):
+        paramvals += (fit.results[i],)
+    return paramvals
+
+def maturityIndex(year,fit):
+    '''Calculates exponentiated and absolute maturity indicies at a given year in a fit'''
+    paramvals = getParams(fit)
+    fitfunc = eval('TIMEfunc.'+fit.fittyp.replace('dNdt',''))
+    nval = fitfunc(year, *paramvals)
+    MIEL = np.log(nval)/np.log(fit.results['L'])
+    MIabs= nval/fit.results['L']   
+    return MIEL, MIabs
+    
+### UNTESTED NEEDS to Have Multi.Queries work as a dict 
+def getMIvalues(csvfile,multi,fittyp='powerlog'):
+    df = pd.read_csv(csvfile,index_col=0,encoding='utf8')
+    dfcopy = df
+    for c,v in df.iterkv():
+        MIabs = []
+        MIEL = []
+        for index,row in v.iterkv():
+            try: # if index in multi.Queries:            
+                MIEL_val, MIabs_val = maturityIndex(row,eval("multi.Queries['"+index+"']."+fittyp))
+                MIabs.append(MIabs_val)
+                MIEL.append(MIEL_val)
+            except:        
+                MIabs.append(0)
+                MIEL.append(0)
+        dfcopy[c+'MIabs'] = MIabs
+        dfcopy[c+'MIEL'] = MIEL
+    dfcopy.to_csv('MIout.csv')
+    return dfcopy      
+
+
+def doafitrunid(j,cur,conn):
+	q=QueryFrame(j,cur,conn)
+	q.loadDataSQL(conn)
+	q.fitCurves(runHindBoot=False)
+	q.writeTOdb(cur,conn)
